@@ -1,0 +1,810 @@
+diff --git a/node_modules/@stewmore/expo-ar/build/ExpoAr.types.d.ts b/node_modules/@stewmore/expo-ar/build/ExpoAr.types.d.ts
+index 7e63d93..755ddaa 100644
+--- a/node_modules/@stewmore/expo-ar/build/ExpoAr.types.d.ts
++++ b/node_modules/@stewmore/expo-ar/build/ExpoAr.types.d.ts
+@@ -68,6 +68,7 @@ export declare const ProjectedPoint: z.ZodObject<{
+     x: z.ZodNumber;
+     y: z.ZodNumber;
+     inFront: z.ZodBoolean;
++    occluded: z.ZodOptional<z.ZodBoolean>;
+ }, z.core.$strip>;
+ export type ProjectedPoint = z.infer<typeof ProjectedPoint>;
+ export declare const ReadyEvent: z.ZodObject<{
+@@ -111,6 +112,7 @@ export declare const ProjectionEvent: z.ZodObject<{
+         x: z.ZodNumber;
+         y: z.ZodNumber;
+         inFront: z.ZodBoolean;
++        occluded: z.ZodOptional<z.ZodBoolean>;
+     }, z.core.$strip>>;
+ }, z.core.$strip>;
+ export type ProjectionEvent = z.infer<typeof ProjectionEvent>;
+@@ -180,6 +182,13 @@ export declare const DetectorInfo: z.ZodObject<{
+     label: z.ZodString;
+ }, z.core.$strip>;
+ export type DetectorInfo = z.infer<typeof DetectorInfo>;
++export type PlanesEvent = {
++    count: number;
++};
++export type WorldMappingStatus = 'notAvailable' | 'limited' | 'extending' | 'mapped';
++export type MappingStatusEvent = {
++    status: WorldMappingStatus;
++};
+ type NativeEvent<T> = {
+     nativeEvent: T;
+ };
+@@ -188,6 +197,8 @@ export interface ExpoArViewProps extends ViewProps {
+     depthEnabled?: boolean;
+     debug?: boolean;
+     emitProjections?: boolean;
++    showPlanes?: boolean;
++    occlusionHints?: boolean;
+     trackingMode?: TrackingMode;
+     detectionEnabled?: boolean;
+     detectionModel?: string;
+@@ -196,16 +207,20 @@ export interface ExpoArViewProps extends ViewProps {
+     onReady?: (e: NativeEvent<ReadyEvent>) => void;
+     onTrackingStateChange?: (e: NativeEvent<TrackingStateEvent>) => void;
+     onTap?: (e: NativeEvent<TapEvent>) => void;
++    onLongPress?: (e: NativeEvent<TapEvent>) => void;
+     onAnchorsChange?: (e: NativeEvent<AnchorsEvent>) => void;
+     onProjection?: (e: NativeEvent<ProjectionEvent>) => void;
+     onDetections?: (e: NativeEvent<DetectionsEvent>) => void;
+     onGeoStateChange?: (e: NativeEvent<GeoStateEvent>) => void;
++    onPlanesChange?: (e: NativeEvent<PlanesEvent>) => void;
++    onMappingStatusChange?: (e: NativeEvent<MappingStatusEvent>) => void;
+     onError?: (e: NativeEvent<ErrorEvent>) => void;
+ }
+ export interface ArViewHandle {
+     raycast(x: number, y: number): Promise<RaycastResult>;
+     addAnchor(x: number, y: number): Promise<{
+         id: string;
++        normal?: [number, number, number];
+     } | null>;
+     removeAnchor(id: string): Promise<void>;
+     listAnchors(): Promise<Anchor[]>;
+@@ -224,6 +239,11 @@ export interface ArViewHandle {
+         id: string;
+     } | null>;
+     getGeospatialPose?(): Promise<GeospatialPose | null>;
++    saveWorldMap?(metadata: string): Promise<number>;
++    setAnchorTransform?(id: string, transform: Transform): Promise<boolean>;
++    getCameraTransform?(): Promise<Transform | null>;
++    attachImage?(anchorId: string, uri: string, width: number, height: number, pose: Transform | null, highlighted: boolean): Promise<boolean>;
++    setModelPose?(anchorId: string, pose: Transform): Promise<boolean>;
+ }
+ export {};
+ //# sourceMappingURL=ExpoAr.types.d.ts.map
+\ No newline at end of file
+diff --git a/node_modules/@stewmore/expo-ar/build/ExpoArModule.d.ts b/node_modules/@stewmore/expo-ar/build/ExpoArModule.d.ts
+index 4cde68b..609051e 100644
+--- a/node_modules/@stewmore/expo-ar/build/ExpoArModule.d.ts
++++ b/node_modules/@stewmore/expo-ar/build/ExpoArModule.d.ts
+@@ -5,6 +5,8 @@ type ExpoArModuleEvents = Record<never, never>;
+ declare class ExpoArModule extends NativeModule<ExpoArModuleEvents> {
+     getCapabilities(): Capabilities;
+     getDetectorInfo(model: string): DetectorInfo;
++    getSavedWorldMapMetadata(): string | null;
++    clearSavedWorldMap(): void;
+ }
+ declare const NativeModuleInstance: ExpoArModule;
+ export declare const ExpoArView: React.ForwardRefExoticComponent<ExpoArViewProps & React.RefAttributes<ArViewHandle>>;
+diff --git a/node_modules/@stewmore/expo-ar/ios/ExpoArModule.swift b/node_modules/@stewmore/expo-ar/ios/ExpoArModule.swift
+index 5c69657..9505c91 100644
+--- a/node_modules/@stewmore/expo-ar/ios/ExpoArModule.swift
++++ b/node_modules/@stewmore/expo-ar/ios/ExpoArModule.swift
+@@ -38,12 +38,23 @@ public class ExpoArModule: Module {
+       ]
+     }
+ 
++    // World-map persistence. The saved map itself is applied natively on the next session
++    // start; JS reads back its own metadata (e.g. notes) and can wipe both.
++    Function("getSavedWorldMapMetadata") { () -> String? in
++      ExpoArWorldMapStore.loadMetadata()
++    }
++    Function("clearSavedWorldMap") {
++      ExpoArWorldMapStore.clear()
++    }
++
+     View(ExpoArView.self) {
+       // Event names are byte-for-byte identical to the Kotlin side — drift here
+       // is the #1 "event never fires" bug.
+       Events(
+-        "onReady", "onTrackingStateChange", "onTap", "onAnchorsChange", "onProjection",
+-        "onGeoStateChange", "onDetections", "onError")
++        "onReady", "onTrackingStateChange", "onTap", "onLongPress", "onAnchorsChange",
++        "onProjection",
++        "onGeoStateChange", "onDetections", "onPlanesChange", "onMappingStatusChange",
++        "onError")
+ 
+       Prop("planeDetection") { (view: ExpoArView, mode: String) in
+         view.setPlaneDetection(mode)
+@@ -57,6 +68,12 @@ public class ExpoArModule: Module {
+       Prop("emitProjections") { (view: ExpoArView, on: Bool) in
+         view.setEmitProjections(on)
+       }
++      Prop("occlusionHints") { (view: ExpoArView, on: Bool) in
++        view.setOcclusionHints(on)
++      }
++      Prop("showPlanes") { (view: ExpoArView, on: Bool) in
++        view.setShowPlanes(on)
++      }
+       // Geospatial extension: "world" | "geo" — switches the session configuration.
+       Prop("trackingMode") { (view: ExpoArView, mode: String) in
+         view.setTrackingMode(mode)
+@@ -118,12 +135,33 @@ public class ExpoArModule: Module {
+       AsyncFunction("detachModel") { (view: ExpoArView, id: String) in
+         view.detachModel(id)
+       }
++      AsyncFunction("attachImage") {
++        (
++          view: ExpoArView, id: String, uri: String, width: Double, height: Double,
++          pose: [Double]?, highlighted: Bool
++        ) -> Bool in
++        view.attachImage(id, uri, width, height, pose, highlighted)
++      }
++      AsyncFunction("setModelPose") { (view: ExpoArView, id: String, pose: [Double]) -> Bool in
++        view.setModelPose(id, pose)
++      }
+ 
+       // CV-fusion extension: anchor at a world transform the detector already computed (skips the
+       // raycast addAnchor(x,y) does). The new anchor flows through onAnchorsChange.
+       AsyncFunction("addAnchorAtWorld") { (view: ExpoArView, transform: [Double]) -> [String: Any]? in
+         view.addAnchorAtWorld(transform)
+       }
++
++      AsyncFunction("setAnchorTransform") { (view: ExpoArView, id: String, transform: [Double]) -> Bool in
++        view.setAnchorTransform(id, transform)
++      }
++      AsyncFunction("getCameraTransform") { (view: ExpoArView) -> [Float]? in
++        view.cameraTransform()
++      }
++
++      AsyncFunction("saveWorldMap") { (view: ExpoArView, metadata: String, promise: Promise) in
++        view.saveWorldMap(metadata: metadata, promise: promise)
++      }
+     }
+   }
+ }
+diff --git a/node_modules/@stewmore/expo-ar/ios/ExpoArView.swift b/node_modules/@stewmore/expo-ar/ios/ExpoArView.swift
+index 8fd72ab..cfe8232 100644
+--- a/node_modules/@stewmore/expo-ar/ios/ExpoArView.swift
++++ b/node_modules/@stewmore/expo-ar/ios/ExpoArView.swift
+@@ -11,10 +11,13 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   let onReady = EventDispatcher()
+   let onTrackingStateChange = EventDispatcher()
+   let onTap = EventDispatcher()
++  let onLongPress = EventDispatcher()
+   let onAnchorsChange = EventDispatcher()
+   let onProjection = EventDispatcher()
+   let onGeoStateChange = EventDispatcher()
+   let onDetections = EventDispatcher()
++  let onPlanesChange = EventDispatcher()
++  let onMappingStatusChange = EventDispatcher()
+   let onError = EventDispatcher()
+ 
+   public let sceneView = ARSCNView(frame: .zero)
+@@ -29,13 +32,29 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   // writes this — removeAnchor/resetSession stay untouched, so the session/anchor logic
+   // remains use-case-agnostic. Keyed by the same anchor id the core hands out.
+   private var modelNodesById: [String: SCNNode] = [:]
++  // Optional node pose relative to the anchor's POSITION (the anchor's rotation is ignored),
++  // set by attachImage/setModelPose. Absent → the node takes the anchor's full transform.
++  private var modelPosesById: [String: simd_float4x4] = [:]
+ 
+   private var planeDetection: ARWorldTrackingConfiguration.PlaneDetection = [.horizontal, .vertical]
+   private var depthEnabled = true
+   // Opt-in per-frame projection of anchors → screen, gated to ~30fps. Off by default so
+   // non-measurement screens pay nothing. lastProjectionEmit is in ARFrame.timestamp units.
+   private var emitProjections = false
++  // Ghost hints (no-LiDAR fallback for occlusion): while projecting, flag anchors that sit
++  // behind a detected vertical plane and dim their model nodes. Off by default.
++  private var occlusionHints = false
+   private var lastProjectionEmit: TimeInterval = 0
++  // Plane visualization + count. showPlanes is read on the render thread (benign Bool race);
++  // planeIds is only touched from ARSessionDelegate callbacks on the main queue.
++  private var showPlanes = false
++  private var planeIds = Set<UUID>()
++  // Last ARFrame.worldMappingStatus sent to JS; nil → emit on the next frame.
++  private var lastMappingStatus: String?
++  // Saved world map loaded before the first session run. Applied to every world-tracking run
++  // until ARKit relocalizes (tracking → normal), then dropped so later re-runs (prop changes,
++  // foregrounding) don't restart relocalization.
++  private var initialWorldMap: ARWorldMap? = ExpoArWorldMapStore.loadMap()
+   // CV-fusion extension: per-frame detection runs the registered processor named `detectionModel`.
+   // Off by default (zero cost). The model is also skipped while a previous run is in flight, and
+   // throttled to `detectionFps`. lastDetectionRun is in ARFrame.timestamp units.
+@@ -75,7 +94,14 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     addSubview(sceneView)
+ 
+     let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
++    let longPress = UILongPressGestureRecognizer(
++      target: self, action: #selector(handleLongPress(_:)))
++    longPress.minimumPressDuration = 0.6
++    // A press is either a tap or a long-press, never both. The long-press fails as soon as
++    // the finger lifts early, so ordinary taps aren't noticeably delayed.
++    tap.require(toFail: longPress)
+     sceneView.addGestureRecognizer(tap)
++    sceneView.addGestureRecognizer(longPress)
+ 
+     // Session lifecycle discipline: a running ARSession holds the camera + motion
+     // sensors. Pause on background/blur, resume on foreground — leaving it running
+@@ -136,6 +162,11 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     sceneView.debugOptions = on ? [.showFeaturePoints, .showWorldOrigin] : []
+   }
+ 
++  func setOcclusionHints(_ on: Bool) {
++    occlusionHints = on
++    if !on { modelNodesById.values.forEach { $0.opacity = 1 } }
++  }
++
+   func setEmitProjections(_ on: Bool) {
+     emitProjections = on
+   }
+@@ -166,6 +197,7 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     let config = ARWorldTrackingConfiguration()
+     config.planeDetection = planeDetection
+     config.environmentTexturing = .automatic
++    config.initialWorldMap = initialWorldMap
+     // depthEnabled → LiDAR scene reconstruction, gated on hardware support so it
+     // degrades cleanly on non-LiDAR devices.
+     if depthEnabled,
+@@ -204,16 +236,26 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   func resetSession() {
+     anchorsById.removeAll()
+     anchorOrder.removeAll()
++    modelNodesById.values.forEach { $0.removeFromParentNode() }
++    modelNodesById.removeAll()
++    modelPosesById.removeAll()
++    initialWorldMap = nil
+     let config = sceneView.session.configuration ?? ARWorldTrackingConfiguration()
++    (config as? ARWorldTrackingConfiguration)?.initialWorldMap = nil
+     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+     emitAnchors()
++    planeIds.removeAll()
++    lastMappingStatus = nil
++    emitPlaneCount()
+   }
+ 
+   // MARK: - Tracking state (ARSessionDelegate)
+   public func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+     let state: String
+     switch camera.trackingState {
+-    case .normal: state = "normal"
++    case .normal:
++      state = "normal"
++      initialWorldMap = nil  // relocalized (or never had a map)
+     case .limited: state = "limited"
+     case .notAvailable: state = "unavailable"
+     }
+@@ -256,22 +298,47 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   // Projects each anchor's world position to screen points so a 2D HUD can pin labels
+   // that track in 3D. Throttled to ~30fps; skipped while not tracking or with <2 anchors.
+   public func session(_ session: ARSession, didUpdate frame: ARFrame) {
++    emitMappingStatusIfChanged(frame)
+     emitGeoIfNeeded(frame)
+     runDetectionIfNeeded(frame)
+-    guard emitProjections, anchorsById.count >= 2 else { return }
++    guard emitProjections, !anchorsById.isEmpty else { return }
+     guard case .normal = frame.camera.trackingState else { return }
+     if frame.timestamp - lastProjectionEmit < 1.0 / 30.0 { return }
+     lastProjectionEmit = frame.timestamp
+ 
+     let camInverse = simd_inverse(frame.camera.transform)
++    let cameraPosition = simd_make_float3(frame.camera.transform.columns.3)
+     let points: [[String: Any]] = orderedAnchorIds().map { id in
+       let column = anchorsById[id]!.transform.columns.3
+-      return projected(id: id, worldX: column.x, worldY: column.y, worldZ: column.z,
+-                       camInverse: camInverse)
++      var point = projected(id: id, worldX: column.x, worldY: column.y, worldZ: column.z,
++                            camInverse: camInverse)
++      let occluded = occlusionHints && isBehindWall(simd_make_float3(column), from: cameraPosition)
++      modelNodesById[id]?.opacity = occluded ? Self.ghostOpacity : 1
++      point["occluded"] = occluded
++      return point
+     }
+     onProjection(["points": points])
+   }
+ 
++  private static let ghostOpacity: CGFloat = 0.3
++  // A wall hit must be this much nearer than the anchor to count as "behind the wall", so
++  // anchors on the wall itself (drawings, wall markers) aren't ghosted.
++  private static let wallTolerance: Float = 0.1
++
++  /// Raycast camera → target against detected vertical planes (real extent only).
++  private func isBehindWall(_ target: simd_float3, from camera: simd_float3) -> Bool {
++    let toTarget = target - camera
++    let distance = simd_length(toTarget)
++    guard distance > Self.wallTolerance else { return false }
++    let query = ARRaycastQuery(
++      origin: camera, direction: toTarget / distance, allowing: .existingPlaneGeometry,
++      alignment: .vertical)
++    return sceneView.session.raycast(query).contains {
++      simd_distance(simd_make_float3($0.worldTransform.columns.3), camera)
++        < distance - Self.wallTolerance
++    }
++  }
++
+   private func orderedAnchorIds() -> [String] {
+     anchorOrder.filter { anchorsById[$0] != nil }
+   }
+@@ -334,14 +401,17 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     onTap(["x": point.x, "y": point.y])
+   }
+ 
++  @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
++    guard gesture.state == .began else { return }
++    let point = gesture.location(in: sceneView)
++    onLongPress(["x": point.x, "y": point.y])
++  }
++
+   // MARK: - Generic primitives
+   /// Screen point → world transform. With LiDAR mesh on, `.estimatedPlane` resolves
+   /// against real geometry; without it, results lean on feature points/planes.
+   func raycast(at point: CGPoint) -> [String: Any] {
+-    guard
+-      let query = sceneView.raycastQuery(from: point, allowing: .estimatedPlane, alignment: .any),
+-      let result = sceneView.session.raycast(query).first
+-    else {
++    guard let result = bestRaycast(at: point) else {
+       return ["worldTransform": NSNull(), "target": NSNull()]
+     }
+     return [
+@@ -350,16 +420,45 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     ]
+   }
+ 
+-  /// Raycast + create a persistent anchor; emits onAnchorsChange.
++  /// Most precise target first, then progressively looser fallbacks so taps still land
++  /// before ARKit has mapped the exact surface under the finger:
++  ///   1. a detected plane's real extent
++  ///   2. an estimated plane (the raycast successor of hitTest's .estimatedHorizontalPlane)
++  ///   3. a detected horizontal plane extended infinitely (tap just past a plane's edge)
++  private func bestRaycast(at point: CGPoint) -> ARRaycastResult? {
++    let attempts: [(ARRaycastQuery.Target, ARRaycastQuery.TargetAlignment)] = [
++      (.existingPlaneGeometry, .any),
++      (.estimatedPlane, .any),
++      (.existingPlaneInfinite, .horizontal),
++    ]
++    for (target, alignment) in attempts {
++      if let query = sceneView.raycastQuery(from: point, allowing: target, alignment: alignment),
++        let result = sceneView.session.raycast(query).first
++      {
++        return result
++      }
++    }
++    return nil
++  }
++
++  /// Raycast + create a persistent anchor; emits onAnchorsChange. Also returns the hit
++  /// surface's normal (the raycast transform's Y axis), flipped to face the camera so it is
++  /// the outward normal of a wall/table as seen by the user.
+   func addAnchor(at point: CGPoint) -> [String: Any]? {
+-    guard
+-      let query = sceneView.raycastQuery(from: point, allowing: .estimatedPlane, alignment: .any),
+-      let result = sceneView.session.raycast(query).first
+-    else {
++    guard let result = bestRaycast(at: point) else {
+       onError(["code": "no_hit", "message": "No surface found at point."])
+       return nil
+     }
+-    return ["id": registerAnchor(ARAnchor(transform: result.worldTransform))]
++    let hit = result.worldTransform
++    var normal = simd_normalize(simd_make_float3(hit.columns.1))
++    if let camera = sceneView.session.currentFrame?.camera.transform {
++      let toCamera = simd_make_float3(camera.columns.3) - simd_make_float3(hit.columns.3)
++      if simd_dot(normal, toCamera) < 0 { normal = -normal }
++    }
++    return [
++      "id": registerAnchor(ARAnchor(transform: hit)),
++      "normal": [normal.x, normal.y, normal.z],
++    ]
+   }
+ 
+   /// CV-fusion extension: anchor directly at a world transform the detector already computed —
+@@ -369,13 +468,43 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+       onError(["code": "bad_transform", "message": "Expected a 16-element column-major transform."])
+       return nil
+     }
++    return ["id": registerAnchor(ARAnchor(transform: matrix(m)))]
++  }
++
++  /// Move an existing anchor. ARAnchor transforms are immutable, so the anchor is replaced by
++  /// a new one whose `name` carries the original public id — that keeps the id stable for JS
++  /// (notes) and across world-map save/restore (ARAnchor.name is archived). Attached models
++  /// follow. Returns false for unknown ids or bad input.
++  func setAnchorTransform(_ id: String, _ m: [Double]) -> Bool {
++    guard m.count == 16, let old = anchorsById[id], type(of: old) == ARAnchor.self else {
++      return false
++    }
++    let replacement = ARAnchor(name: id, transform: matrix(m))
++    sceneView.session.remove(anchor: old)
++    sceneView.session.add(anchor: replacement)
++    anchorsById[id] = replacement
++    placeModel(id)
++    emitAnchors()
++    return true
++  }
++
++  /// Current camera pose (column-major 16 floats), or nil before the first frame.
++  func cameraTransform() -> [Float]? {
++    sceneView.session.currentFrame.map { flatten($0.camera.transform) }
++  }
++
++  /// Public anchor id: the original id carried in `name` for moved anchors, else the UUID.
++  private func publicId(_ anchor: ARAnchor) -> String {
++    anchor.name ?? anchor.identifier.uuidString
++  }
++
++  private func matrix(_ m: [Double]) -> simd_float4x4 {
+     let f = m.map { Float($0) }
+-    let transform = simd_float4x4(
++    return simd_float4x4(
+       simd_float4(f[0], f[1], f[2], f[3]),
+       simd_float4(f[4], f[5], f[6], f[7]),
+       simd_float4(f[8], f[9], f[10], f[11]),
+       simd_float4(f[12], f[13], f[14], f[15]))
+-    return ["id": registerAnchor(ARAnchor(transform: transform))]
+   }
+ 
+   // Shared anchor-registration tail (add to session + bookkeeping + emit) used by addAnchor,
+@@ -383,7 +512,7 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   @discardableResult
+   private func registerAnchor(_ anchor: ARAnchor) -> String {
+     sceneView.session.add(anchor: anchor)
+-    let id = anchor.identifier.uuidString
++    let id = publicId(anchor)
+     anchorsById[id] = anchor
+     anchorOrder.append(id)
+     emitAnchors()
+@@ -406,6 +535,30 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     anchorOrder.compactMap { anchorsById[$0] }
+   }
+ 
++  /// Capture the current world map (anchors included) and persist it with `metadata`.
++  /// Resolves with the number of user anchors saved. Refuses until ARKit has mapped enough
++  /// of the space — a map captured in .limited/.notAvailable relocalizes poorly.
++  func saveWorldMap(metadata: String, promise: Promise) {
++    switch sceneView.session.currentFrame?.worldMappingStatus {
++    case .mapped?, .extending?: break
++    default:
++      promise.reject("E_MAP_NOT_READY", "Not enough of the space is mapped yet. Keep moving the phone.")
++      return
++    }
++    sceneView.session.getCurrentWorldMap { map, error in
++      guard let map else {
++        promise.reject("E_MAP_UNAVAILABLE", error?.localizedDescription ?? "World map unavailable.")
++        return
++      }
++      do {
++        try ExpoArWorldMapStore.save(map, metadata: metadata)
++        promise.resolve(map.anchors.filter { type(of: $0) == ARAnchor.self }.count)
++      } catch {
++        promise.reject("E_MAP_SAVE", error.localizedDescription)
++      }
++    }
++  }
++
+   func snapshotBase64() -> String {
+     sceneView.snapshot().jpegData(compressionQuality: 0.8)?.base64EncodedString() ?? ""
+   }
+@@ -532,6 +685,92 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+   /// Remove a placed node. JS calls this alongside the core's removeAnchor.
+   func detachModel(_ id: String) {
+     modelNodesById.removeValue(forKey: id)?.removeFromParentNode()
++    modelPosesById.removeValue(forKey: id)
++  }
++
++  /// Attach a flat image (e.g. a transparent PNG drawing) of `width`×`height` meters.
++  /// With `pose` (column-major 4x4, relative to the anchor's position, ignoring its rotation)
++  /// the image's +Z face points along the pose's Z axis — e.g. wall-attached. Without it the
++  /// image stands upright on the anchor and turns about world Y to face the camera.
++  /// Returns false for unknown anchors or unreadable images.
++  func attachImage(
++    _ id: String, _ uri: String, _ width: Double, _ height: Double, _ pose: [Double]?,
++    _ highlighted: Bool
++  ) -> Bool {
++    let path = URL(string: uri).flatMap { $0.isFileURL ? $0.path : nil } ?? uri
++    guard anchorsById[id] != nil, let loaded = UIImage(contentsOfFile: path) else { return false }
++    let image = Self.textureImage(loaded)
++    detachModel(id)
++
++    let plane = SCNPlane(width: CGFloat(width), height: CGFloat(height))
++    plane.firstMaterial?.diffuse.contents = image
++    plane.firstMaterial?.lightingModel = .constant
++    // Double-sided: user rotations (e.g. yaw 180°) can turn the face away from the viewer.
++    plane.firstMaterial?.isDoubleSided = true
++    let imageNode = SCNNode(geometry: plane)
++    let node = SCNNode()
++    node.addChildNode(imageNode)
++
++    if highlighted {
++      let frame = SCNPlane(width: CGFloat(width) + 0.04, height: CGFloat(height) + 0.04)
++      frame.cornerRadius = 0.01
++      frame.firstMaterial?.diffuse.contents = UIColor(red: 0.2, green: 0.9, blue: 1.0, alpha: 0.35)
++      frame.firstMaterial?.lightingModel = .constant
++      frame.firstMaterial?.isDoubleSided = true
++      let frameNode = SCNNode(geometry: frame)
++      frameNode.position.z = -0.001
++      imageNode.addChildNode(frameNode)
++    }
++
++    if let pose, pose.count == 16 {
++      modelPosesById[id] = matrix(pose)
++    } else {
++      imageNode.position.y = Float(height / 2)  // stand on the surface
++      let billboard = SCNBillboardConstraint()
++      billboard.freeAxes = .Y
++      node.constraints = [billboard]
++    }
++    sceneView.scene.rootNode.addChildNode(node)
++    modelNodesById[id] = node
++    placeModel(id)
++    return true
++  }
++
++  /// Update the anchor-relative pose of an attached node (see attachImage). Cheap — no
++  /// reload — so it can follow a slider.
++  func setModelPose(_ id: String, _ pose: [Double]) -> Bool {
++    guard pose.count == 16, modelNodesById[id] != nil else { return false }
++    modelPosesById[id] = matrix(pose)
++    placeModel(id)
++    return true
++  }
++
++  // Camera photos are often 12 MP+; as a SceneKit texture that's ~50 MB each. Downscale to a
++  // sane size, and bake in EXIF orientation (SceneKit samples the raw CGImage, ignoring it).
++  private static let maxTexturePx: CGFloat = 2048
++
++  private static func textureImage(_ image: UIImage) -> UIImage {
++    let pixels = CGSize(
++      width: image.size.width * image.scale, height: image.size.height * image.scale)
++    let factor = min(1, maxTexturePx / max(pixels.width, pixels.height))
++    guard factor < 1 || image.imageOrientation != .up else { return image }
++    let target = CGSize(width: pixels.width * factor, height: pixels.height * factor)
++    let format = UIGraphicsImageRendererFormat()
++    format.scale = 1  // target is already in pixels; keeps alpha (drawings) intact
++    return UIGraphicsImageRenderer(size: target, format: format).image { _ in
++      image.draw(in: CGRect(origin: .zero, size: target))
++    }
++  }
++
++  private func placeModel(_ id: String) {
++    guard let node = modelNodesById[id], let anchor = anchorsById[id] else { return }
++    guard let pose = modelPosesById[id] else {
++      node.simdTransform = anchor.transform
++      return
++    }
++    var translation = matrix_identity_float4x4
++    translation.columns.3 = anchor.transform.columns.3
++    node.simdTransform = translation * pose
+   }
+ 
+   private func loadModelNode(_ uri: String) -> SCNNode {
+@@ -543,11 +782,181 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+       scene.rootNode.childNodes.forEach { container.addChildNode($0) }
+       return container
+     }
++    if uri == "builtin:sphere" { return glowingSphereNode() }
++    if uri == "builtin:sphere-highlight" { return glowingSphereNode(highlighted: true) }
++    if uri == "builtin:sphere-warning" { return glowingSphereNode(warning: true) }
+     let box = SCNBox(width: 0.1, height: 0.1, length: 0.1, chamferRadius: 0.005)
+     box.firstMaterial?.diffuse.contents = UIColor.systemTeal
+     return SCNNode(geometry: box)
+   }
+ 
++  /// Small unlit sphere with a pulsing additive halo — reads as a "glowing" marker
++  /// without needing lights or post-processing.
++  private func glowingSphereNode(highlighted: Bool = false, warning: Bool = false) -> SCNNode {
++    let color =
++      highlighted
++      ? UIColor(red: 0.2, green: 0.9, blue: 1.0, alpha: 1)
++      : warning
++        ? UIColor(red: 1.0, green: 0.5, blue: 0.1, alpha: 1)
++        : UIColor(red: 1.0, green: 0.84, blue: 0.2, alpha: 1)
++    let scale: CGFloat = highlighted ? 1.5 : 1
++
++    let core = SCNSphere(radius: 0.02 * scale)
++    core.firstMaterial?.lightingModel = .constant
++    core.firstMaterial?.diffuse.contents = color
++    let node = SCNNode(geometry: core)
++
++    let halo = SCNSphere(radius: 0.04 * scale)
++    halo.firstMaterial?.lightingModel = .constant
++    halo.firstMaterial?.diffuse.contents = color.withAlphaComponent(0.3)
++    halo.firstMaterial?.blendMode = .add
++    halo.firstMaterial?.writesToDepthBuffer = false
++    let haloNode = SCNNode(geometry: halo)
++    let pulse = SCNAction.sequence([
++      .scale(to: 1.3, duration: 0.8),
++      .scale(to: 1.0, duration: 0.8),
++    ])
++    pulse.timingMode = .easeInEaseOut
++    haloNode.runAction(.repeatForever(pulse))
++    node.addChildNode(haloNode)
++    return node
++  }
++
++  // MARK: - Plane visualization (opt-in via showPlanes) + plane count (onPlanesChange)
++  private static let planeNodeName = "expoAr.plane"
++
++  // MARK: - LiDAR occlusion
++  // ARSCNView doesn't occlude virtual content with the reconstructed mesh on its own. Each
++  // ARMeshAnchor gets an invisible, depth-only copy of its mesh, so anything behind real
++  // geometry fails the depth test. Mesh anchors only exist while scene reconstruction runs
++  // (depthEnabled on a LiDAR device). The copy is pushed this far into the surface along the
++  // vertex normals so content ON the surface (wall drawings 3 mm off, plane overlays,
++  // half-buried markers) isn't eaten by mesh noise.
++  private static let occluderNodeName = "expoAr.occluder"
++  private static let occluderInset: Float = 0.03
++
++  /// Copies vertices (ARKit reuses its Metal buffers) and builds a depth-only geometry.
++  private func occluderGeometry(_ mesh: ARMeshGeometry) -> SCNGeometry {
++    let vertices = mesh.vertices
++    let normals = mesh.normals
++    let vBase = vertices.buffer.contents().advanced(by: vertices.offset)
++    let nBase = normals.buffer.contents().advanced(by: normals.offset)
++    var points = [SCNVector3]()
++    points.reserveCapacity(vertices.count)
++    for i in 0..<vertices.count {
++      let v = vBase.advanced(by: i * vertices.stride).assumingMemoryBound(to: Float.self)
++      let n = nBase.advanced(by: i * normals.stride).assumingMemoryBound(to: Float.self)
++      let inset = Self.occluderInset
++      points.append(SCNVector3(v[0] - n[0] * inset, v[1] - n[1] * inset, v[2] - n[2] * inset))
++    }
++    let faces = mesh.faces
++    let indexData = Data(
++      bytes: faces.buffer.contents(),
++      count: faces.count * faces.indexCountPerPrimitive * faces.bytesPerIndex)
++    let element = SCNGeometryElement(
++      data: indexData, primitiveType: .triangles, primitiveCount: faces.count,
++      bytesPerIndex: faces.bytesPerIndex)
++    let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: points)], elements: [element])
++    let material = SCNMaterial()
++    material.colorBufferWriteMask = []
++    material.writesToDepthBuffer = true
++    material.isDoubleSided = true
++    geometry.materials = [material]
++    return geometry
++  }
++
++  func setShowPlanes(_ on: Bool) {
++    showPlanes = on
++    sceneView.scene.rootNode
++      .childNodes { node, _ in node.name == Self.planeNodeName }
++      .forEach { $0.isHidden = !on }
++  }
++
++  // Called on SceneKit's render thread. Every plane gets an overlay node; showPlanes only
++  // toggles visibility so turning it on later reveals planes found earlier.
++  public func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
++    if let meshAnchor = anchor as? ARMeshAnchor {
++      let occluder = SCNNode(geometry: occluderGeometry(meshAnchor.geometry))
++      occluder.name = Self.occluderNodeName
++      occluder.renderingOrder = -1  // write depth before any virtual content draws
++      node.addChildNode(occluder)
++      return
++    }
++    guard let planeAnchor = anchor as? ARPlaneAnchor,
++      let device = sceneView.device,
++      let geometry = ARSCNPlaneGeometry(device: device)
++    else { return }
++    geometry.update(from: planeAnchor.geometry)
++    geometry.firstMaterial?.diffuse.contents = UIColor.white.withAlphaComponent(0.25)
++    geometry.firstMaterial?.lightingModel = .constant
++    geometry.firstMaterial?.isDoubleSided = true
++    geometry.firstMaterial?.writesToDepthBuffer = false
++    let planeNode = SCNNode(geometry: geometry)
++    planeNode.name = Self.planeNodeName
++    planeNode.isHidden = !showPlanes
++    node.addChildNode(planeNode)
++  }
++
++  public func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
++    if let meshAnchor = anchor as? ARMeshAnchor {
++      node.childNode(withName: Self.occluderNodeName, recursively: false)?.geometry =
++        occluderGeometry(meshAnchor.geometry)
++      return
++    }
++    guard let planeAnchor = anchor as? ARPlaneAnchor,
++      let geometry = node.childNode(withName: Self.planeNodeName, recursively: false)?.geometry
++        as? ARSCNPlaneGeometry
++    else { return }
++    geometry.update(from: planeAnchor.geometry)
++  }
++
++  // ARSessionDelegate runs on the main queue (delegateQueue is nil).
++  public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
++    // Plain ARAnchors we didn't create ourselves were restored from a saved world map (same
++    // identifiers as when saved). Adopt them so they flow through onAnchorsChange/projection.
++    // Exact type match skips planes, LiDAR mesh anchors, geo anchors, etc.
++    let restored = anchors.filter {
++      type(of: $0) == ARAnchor.self && anchorsById[publicId($0)] == nil
++    }
++    for anchor in restored {
++      let id = publicId(anchor)
++      anchorsById[id] = anchor
++      anchorOrder.append(id)
++    }
++    if !restored.isEmpty { emitAnchors() }
++
++    let before = planeIds.count
++    anchors.filter { $0 is ARPlaneAnchor }.forEach { planeIds.insert($0.identifier) }
++    if planeIds.count != before { emitPlaneCount() }
++  }
++
++  public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
++    let before = planeIds.count
++    anchors.forEach { planeIds.remove($0.identifier) }
++    if planeIds.count != before { emitPlaneCount() }
++  }
++
++  // MARK: - World-mapping quality (onMappingStatusChange)
++  // Emitted only on change, so it costs nothing per frame. Low status means ARKit hasn't
++  // mapped enough of the space yet and raycast depth is less reliable.
++  private func emitMappingStatusIfChanged(_ frame: ARFrame) {
++    let status: String
++    switch frame.worldMappingStatus {
++    case .notAvailable: status = "notAvailable"
++    case .limited: status = "limited"
++    case .extending: status = "extending"
++    case .mapped: status = "mapped"
++    @unknown default: status = "notAvailable"
++    }
++    guard status != lastMappingStatus else { return }
++    lastMappingStatus = status
++    onMappingStatusChange(["status": status])
++  }
++
++  private func emitPlaneCount() {
++    onPlanesChange(["count": planeIds.count])
++  }
++
+   // MARK: - Anchor serialization (column-major 16-float transform — matches the contract)
+   private func emitAnchors() {
+     onAnchorsChange(["anchors": orderedAnchors().map(serialize)])
+@@ -563,7 +972,7 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+       type = "point"
+     }
+     return [
+-      "id": anchor.identifier.uuidString,
++      "id": publicId(anchor),
+       "transform": flatten(anchor.transform),
+       "type": type,
+     ]
+@@ -588,3 +997,36 @@ open class ExpoArView: ExpoView, ARSCNViewDelegate, ARSessionDelegate {
+     }
+   }
+ }
++
++
++// World-map persistence: one saved ARWorldMap (NSKeyedArchiver) plus an opaque metadata
++// string JS owns (e.g. notes keyed by anchor id), both under Documents/ExpoArWorldMap/.
++// Written together so the map and its metadata never drift apart.
++enum ExpoArWorldMapStore {
++  private static var directory: URL {
++    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
++      .appendingPathComponent("ExpoArWorldMap", isDirectory: true)
++  }
++  private static var mapURL: URL { directory.appendingPathComponent("worldmap.arexperience") }
++  private static var metadataURL: URL { directory.appendingPathComponent("metadata.json") }
++
++  static func save(_ map: ARWorldMap, metadata: String) throws {
++    let data = try NSKeyedArchiver.archivedData(withRootObject: map, requiringSecureCoding: true)
++    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++    try data.write(to: mapURL, options: .atomic)
++    try Data(metadata.utf8).write(to: metadataURL, options: .atomic)
++  }
++
++  static func loadMap() -> ARWorldMap? {
++    guard let data = try? Data(contentsOf: mapURL) else { return nil }
++    return try? NSKeyedUnarchiver.unarchivedObject(ofClass: ARWorldMap.self, from: data)
++  }
++
++  static func loadMetadata() -> String? {
++    try? String(contentsOf: metadataURL, encoding: .utf8)
++  }
++
++  static func clear() {
++    try? FileManager.default.removeItem(at: directory)
++  }
++}

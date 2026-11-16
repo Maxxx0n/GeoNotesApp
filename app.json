@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "GeoNotesApp",
+    "slug": "GeoNotesApp",
+    "version": "1.0.0",
+    "plugins": [
+      [
+        "@stewmore/expo-ar",
+        {
+          "cameraPermission": "GeoNotesApp uses the camera for AR plane detection and anchor placement.",
+          "arRequired": false
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "enableSceneSupport": true
+          }
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "GeoNotesApp uses your photos to pin pictures to places in AR."
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.mvasiltsov.geonotesapp",
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.anonymous.GeoNotesApp"
+    }
+  }
+}
